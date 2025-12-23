@@ -152,6 +152,20 @@ def build_session(token: str) -> Session:
     return session
 
 
+def normalize_base(url: str) -> str:
+    return url.rstrip("/")
+
+
+def fallback_base_urls(user_base: str) -> List[str]:
+    # Try user-specified base first, then common host variants to dodge 404s
+    candidates = [normalize_base(user_base or DEFAULT_BASE_URL)]
+    for alt in ("https://www.workato.com", "https://app.workato.com", "https://www.workato.eu"):
+        alt_norm = normalize_base(alt)
+        if alt_norm not in candidates:
+            candidates.append(alt_norm)
+    return candidates
+
+
 def extract_projects(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [p for p in payload if isinstance(p, dict)]
@@ -265,12 +279,15 @@ def load_assets_from_file(path: Path) -> List[Dict[str, Any]]:
 def prompt_folder_id(project: Dict[str, Any]) -> Optional[int]:
     project_name = project.get("name") or project.get("title") or "(no name)"
     pid = project.get("id") or project.get("project_id") or ""
+    project_folder_raw = project.get("folder_id")
+    proj_folder_id = int(project_folder_raw) if project_folder_raw is not None else 0
     entered = input(
-        f"Enter folder_id to auto-generate assets for project '{project_name}' (id={pid}), "
-        "or leave blank to skip this project: "
+        f"Enter folder_id to auto-generate assets for project '{project_name}' "
+        f"(project id={pid}, project folder_id={proj_folder_id}). "
+        f"Press Enter to use project folder_id ({proj_folder_id}): "
     ).strip()
     if not entered:
-        return None
+        return proj_folder_id
     if not entered.isdigit():
         raise ValueError("folder_id must be numeric.")
     return int(entered)
@@ -293,9 +310,7 @@ def build_manifest_payload(
         payload["export_manifest"]["assets"] = load_assets_from_file(args.assets_file)
     else:
         if folder_id is None:
-            raise ValueError(
-                "Either --assets-file or a folder_id is required to create a manifest."
-            )
+            folder_id = 0  # default root folder if project folder_id unavailable
         payload["export_manifest"]["auto_generate_assets"] = True
         payload["export_manifest"]["folder_id"] = folder_id
         if args.include_test_cases:
@@ -358,15 +373,24 @@ def download_package_zip(
     override_name: Optional[str] = None,
 ) -> Path:
     package_id = package.get("id")
-    download_url = package.get("download_url")
-    if not download_url:
-        raise RuntimeError(f"Package {package_id} has no download_url yet.")
+    if not package_id:
+        raise RuntimeError(f"Package payload missing id: {package}")
 
-    if download_url.startswith("/"):
-        download_url = f"{base_url.rstrip('/')}{download_url}"
+    download_endpoint = f"{base_url.rstrip('/')}{PACKAGE_DOWNLOAD.format(package_id=package_id)}"
 
-    resp = session.get(download_url, timeout=60, stream=True, allow_redirects=True)
-    resp.raise_for_status()
+    def _fetch(url: str) -> requests.Response:
+        resp = session.get(url, timeout=60, stream=True, allow_redirects=True)
+        resp.raise_for_status()
+        return resp
+
+    try:
+        resp = _fetch(download_endpoint)
+    except requests.HTTPError as exc:
+        # Retry once on client errors that can stem from short-lived redirects
+        if exc.response is not None and exc.response.status_code in {400, 403}:
+            resp = _fetch(download_endpoint)
+        else:
+            raise
 
     filename = override_name or f"package-{package_id}.zip"
     cd = resp.headers.get("Content-Disposition")
@@ -434,29 +458,48 @@ def main() -> None:
         try:
             folder_id = args.folder_id
             if not args.assets_file and folder_id is None:
-                folder_id = prompt_folder_id(project)
+                if args.yes:
+                    project_folder_raw = project.get("folder_id")
+                    folder_id = int(project_folder_raw) if project_folder_raw is not None else 0
+                    print(f"Using project folder_id={folder_id} for '{project_name}' (auto-selected).")
+                else:
+                    folder_id = prompt_folder_id(project)
             manifest_payload = build_manifest_payload(project_name or "project", args, folder_id)
         except Exception as exc:  # noqa: BLE001
             print(f"Skipping project '{project_name}': {exc}", file=sys.stderr)
             continue
 
-        try:
-            manifest = create_export_manifest(session, args.base_url, manifest_payload)
-            manifest_id = manifest["id"]
-            print(f"Created export manifest {manifest_id} for project '{project_name}'.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"Failed to create export manifest for '{project_name}': {exc}", file=sys.stderr)
+        manifest = None
+        working_base = None
+        for candidate_base in fallback_base_urls(args.base_url):
+            try:
+                manifest = create_export_manifest(session, candidate_base, manifest_payload)
+                working_base = candidate_base
+                break
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    # Try the next base URL on hard 404s (path not found)
+                    continue
+                raise
+        if manifest is None or working_base is None:
+            print(
+                f"Failed to create export manifest for '{project_name}': "
+                f"No base URL worked (tried {fallback_base_urls(args.base_url)}).",
+                file=sys.stderr,
+            )
             continue
+        manifest_id = manifest["id"]
+        print(f"Created export manifest {manifest_id} for project '{project_name}' (base: {working_base}).")
 
         try:
-            package_meta = export_package(session, args.base_url, manifest_id)
+            package_meta = export_package(session, working_base, manifest_id)
             package_id = package_meta.get("id")
             if not package_id:
                 raise RuntimeError(f"Unexpected package export response: {package_meta}")
             print(f"Started package export {package_id} from manifest {manifest_id} for '{project_name}'.")
             package_final = wait_for_package(
                 session,
-                args.base_url,
+                working_base,
                 package_id,
                 args.poll_interval,
                 args.poll_timeout,
@@ -467,7 +510,7 @@ def main() -> None:
                 raise RuntimeError(f"Package export failed or incomplete: {package_final}")
             zip_path = download_package_zip(
                 session,
-                args.base_url,
+                working_base,
                 package_final,
                 output_dir=output_dir,
                 override_name=args.output_zip_name,
@@ -479,21 +522,22 @@ def main() -> None:
 
         # Confirm and delete package
         try:
-            package_json = json.dumps(package_final, indent=2)
+            package_latest = get_package(session, working_base, package_id)
+            package_json = json.dumps(package_latest, indent=2)
             print(f"Package details (review before delete):\n{package_json}")
             if prompt_yes_no(
                 f"Delete package {package_id} now?",
                 default_no=True,
                 assume_yes=args.yes,
             ):
-                delete_resp = delete_package(session, args.base_url, package_id)
+                delete_resp = delete_package(session, working_base, package_id)
                 print(f"Deleted package {package_id}: {delete_resp}")
         except Exception as exc:  # noqa: BLE001
             print(f"Error while deleting package {package_id}: {exc}", file=sys.stderr)
 
         # Confirm and delete manifest
         try:
-            manifest_view = view_manifest(session, args.base_url, manifest_id)
+            manifest_view = view_manifest(session, working_base, manifest_id)
             manifest_json = json.dumps(manifest_view, indent=2)
             print(f"Manifest details (review before delete):\n{manifest_json}")
             if prompt_yes_no(
@@ -501,7 +545,7 @@ def main() -> None:
                 default_no=True,
                 assume_yes=args.yes,
             ):
-                delete_resp = delete_manifest(session, args.base_url, manifest_id)
+                delete_resp = delete_manifest(session, working_base, manifest_id)
                 print(f"Deleted manifest {manifest_id}: {delete_resp}")
         except Exception as exc:  # noqa: BLE001
             print(f"Error while deleting manifest {manifest_id}: {exc}", file=sys.stderr)

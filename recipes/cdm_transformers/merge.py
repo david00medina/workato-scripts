@@ -1,12 +1,12 @@
 """
-CDM Diff Transformer
-====================
-Computes the set difference A - B between two CDM payloads.
-Returns records present in CDM A but not in CDM B under the specified
-object_type.  Two records are considered equal (and therefore removed from A)
-only when **all fields except the identity block** are identical.  The
-identity block is excluded from comparison because IDs may differ across
-source systems while the business data is the same.
+CDM Merge Transformer
+=====================
+Computes the set union A ∪ B between two CDM payloads.
+Combines all records from CDM A and CDM B under the specified object_type,
+deduplicating by **content equality** (every field except the ``identity``
+block).  The identity block is excluded from comparison because IDs may
+differ across source systems while the business data is the same.
+When a duplicate is found, the version from A takes precedence (A wins).
 
 Matching is done via SHA-256 hashes of the non-identity content, giving
 O(n) set construction and O(1) per-record lookups.
@@ -45,10 +45,11 @@ def _content_hash(record: dict) -> str:
 
 
 def main(input: dict) -> dict:
-    """Compute A - B on the *object_type* array and return a new CDM payload
-    wrapped in ``{"diff_cdm": "<json string>"}``.
+    """Compute A ∪ B on the *object_type* array and return a new CDM payload
+    wrapped in ``{"merged_cdm": "<json string>"}``.
 
-    Two records match when every field **except** ``identity`` is equal.
+    Deduplication strategy: two records are duplicates when all fields
+    **except** ``identity`` are equal.  A's version wins on duplicates.
     """
     cdm_a_raw = input.get("raw_cdm_a", "")
     cdm_b_raw = input.get("raw_cdm_b", "")
@@ -78,20 +79,28 @@ def main(input: dict) -> dict:
     records_a: list[dict] = cdm_a[object_type]
     records_b: list[dict] = cdm_b[object_type]
 
-    # ---- Step 3: Build a set of content hashes from B  -----------------------
-    # O(|B|) construction – each lookup is then O(1).
-    b_hashes: set[str] = {_content_hash(rec) for rec in records_b}
+    # ---- Step 3: Build a set of content hashes from A (O(|A|)) ---------------
+    seen_hashes: set[str] = set()
+    merged_records: list[dict] = []
 
-    # ---- Step 4: Filter A - B (keep A records whose content is not in B) -----
-    diff_records = [
-        rec for rec in records_a
-        if _content_hash(rec) not in b_hashes
-    ]
+    # A records go in first — they take precedence
+    for rec in records_a:
+        h = _content_hash(rec)
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            merged_records.append(rec)
+
+    # ---- Step 4: Append B records whose content is not already in A (O(|B|)) -
+    for rec in records_b:
+        h = _content_hash(rec)
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            merged_records.append(rec)
 
     # ---- Build the new CDM shell ---------------------------------------------
     new_cdm: dict = {
         "metadata": copy.deepcopy(cdm_a.get("metadata", {})),
-        object_type: diff_records,
+        object_type: merged_records,
         "audit": {},
     }
 
@@ -117,7 +126,7 @@ def main(input: dict) -> dict:
         "parent_message_id": old_msg_id,
         "parent_batch_ids": parent_batch_ids,
         "transformation_step": (
-            f'diff => "{object_type}: A({old_batch_id}) - B({b_batch_id})"'
+            f'merge => "{object_type}: A({old_batch_id}) ∪ B({b_batch_id})"'
         ),
     }
 
@@ -141,29 +150,33 @@ def main(input: dict) -> dict:
         "workato_url": workato_url,
     }
 
-    diff_json_bytes = json.dumps(
-        diff_records, separators=(",", ":"), sort_keys=True
+    merged_json_bytes = json.dumps(
+        merged_records, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
-    batch_hash = hashlib.sha256(diff_json_bytes).hexdigest()
+    batch_hash = hashlib.sha256(merged_json_bytes).hexdigest()
 
     new_meta["batch"] = {
         "batch_id": batch_hash,
-        "record_count": int(len(diff_records)),
+        "record_count": int(len(merged_records)),
     }
 
     # ---- Step 7: Fill audit section ------------------------------------------
+    # Count how many records came exclusively from B (new additions)
+    added_from_b = int(len(merged_records)) - int(len(records_a))
+
     new_cdm["audit"] = {
         "last_modified_by": "Workato Transformer",
         "change_log": (
-            f"Diff Transformer: {object_type} A - B "
+            f"Merge Transformer: {object_type} A ∪ B "
             f"(A: {len(records_a)} records, B: {len(records_b)} records, "
-            f"result: {len(diff_records)} records)"
+            f"added from B: {added_from_b}, "
+            f"result: {len(merged_records)} records)"
         ),
     }
 
     # ---- Step 8: Serialize and return ----------------------------------------
-    diff_cdm_string = json.dumps(new_cdm, ensure_ascii=False)
-    return {"diff_cdm": diff_cdm_string}
+    merged_cdm_string = json.dumps(new_cdm, ensure_ascii=False)
+    return {"merged_cdm": merged_cdm_string}
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +207,9 @@ if __name__ == "__main__":
         ],
     }
 
-    # CDM B: Sales with DIFFERENT id but SAME content  →  should match & be removed
-    #        Sales (updated) with same id but DIFFERENT content  →  should NOT match
-    cdm_b_same_content = {
+    # --- Test 1: B has same content with different IDs → deduplicated ---------
+    # B: Sales (different ID, same content = dup), Marketing (new), Finance (new)
+    cdm_b_1 = {
         "metadata": {
             "message": {"msg_id": "bbb-222", "correlation_id": "job-002",
                         "timestamp_utc": "2026-04-01T13:00:00.000000Z"},
@@ -204,45 +217,50 @@ if __name__ == "__main__":
                       "object_type": "Department", "source_event": "Scheduler"},
             "processing": {"workflow_id": "recipe-100",
                            "workato_url": "https://workato.com/recipes/100"},
-            "batch": {"batch_id": "batch-b-hash", "record_count": 1},
+            "batch": {"batch_id": "batch-b1-hash", "record_count": 3},
         },
         "departments": [
-            # Same core content as A's "Sales" but different identity
+            # Same core as A's "Sales" but with a completely different identity
             {"identity": {"canonical_id": "9999",
                           "external_keys": {"odoo_id": "OD-50"}},
              "core": {"department_name": "Sales", "parent": "", "dealer_key": ""}},
+            {"identity": {"canonical_id": "1004",
+                          "external_keys": {"bigquery_id": "1004"}},
+             "core": {"department_name": "Marketing", "parent": "", "dealer_key": ""}},
+            {"identity": {"canonical_id": "1005",
+                          "external_keys": {"bigquery_id": "1005"}},
+             "core": {"department_name": "Finance", "parent": "", "dealer_key": ""}},
         ],
     }
 
-    # --- Test 1: same content, different identity → removed -------------------
     result1 = main({
         "raw_cdm_a": json.dumps(cdm_a),
-        "raw_cdm_b": json.dumps(cdm_b_same_content),
-        "recipe_id": "recipe-300", "job_id": "job-900",
-        "workato_url": "https://workato.com/recipes/300",
+        "raw_cdm_b": json.dumps(cdm_b_1),
+        "recipe_id": "recipe-400", "job_id": "job-950",
+        "workato_url": "https://workato.com/recipes/400",
         "source_event": "Scheduler", "source_system": "BigQuery",
         "object_type": "departments",
     })
-    parsed1 = json.loads(result1["diff_cdm"])
-    print("=== Test 1: B has Sales with different ID but same content ===")
-    print(f"Result count: {len(parsed1['departments'])}  (expected 2: Engineering, HR)")
+    parsed1 = json.loads(result1["merged_cdm"])
+    print("=== Test 1: B has Sales with different ID but same content (dup) ===")
+    print(f"Result count: {len(parsed1['departments'])}  (expected 5: Eng, Sales, HR, Marketing, Finance)")
     print(f"Result depts: {[d['core']['department_name'] for d in parsed1['departments']]}")
     print()
 
-    # --- Test 2: same id, different content → NOT removed ---------------------
-    cdm_b_diff_content = copy.deepcopy(cdm_b_same_content)
-    cdm_b_diff_content["departments"][0]["identity"]["canonical_id"] = "1002"
-    cdm_b_diff_content["departments"][0]["core"]["department_name"] = "Sales (updated)"
+    # --- Test 2: B has same ID but different content → both kept --------------
+    cdm_b_2 = copy.deepcopy(cdm_b_1)
+    cdm_b_2["departments"][0]["identity"]["canonical_id"] = "1002"
+    cdm_b_2["departments"][0]["core"]["department_name"] = "Sales (updated)"
 
     result2 = main({
         "raw_cdm_a": json.dumps(cdm_a),
-        "raw_cdm_b": json.dumps(cdm_b_diff_content),
-        "recipe_id": "recipe-300", "job_id": "job-901",
-        "workato_url": "https://workato.com/recipes/300",
+        "raw_cdm_b": json.dumps(cdm_b_2),
+        "recipe_id": "recipe-400", "job_id": "job-951",
+        "workato_url": "https://workato.com/recipes/400",
         "source_event": "Scheduler", "source_system": "BigQuery",
         "object_type": "departments",
     })
-    parsed2 = json.loads(result2["diff_cdm"])
+    parsed2 = json.loads(result2["merged_cdm"])
     print("=== Test 2: B has Sales (updated) with same ID but different content ===")
-    print(f"Result count: {len(parsed2['departments'])}  (expected 3: all kept)")
+    print(f"Result count: {len(parsed2['departments'])}  (expected 6: all unique content)")
     print(f"Result depts: {[d['core']['department_name'] for d in parsed2['departments']]}")

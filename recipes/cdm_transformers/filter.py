@@ -3,25 +3,18 @@ CDM Filter Transformer
 =======================
 Parses a raw CDM JSON payload, filters the records under a given object_type
 using a list of filter predicates (dot-notation fields, operators, values),
-and returns a new CDM structure with updated metadata, lineage, and audit.
+and returns a new CDM structure.  The original metadata and audit objects are
+inherited untouched; only metadata.batch and metadata.lineage are updated.
 
 Input parameters
 ----------------
 raw_cdm        : str   – JSON string of the full CDM payload
-recipe_id      : str   – workflow / recipe identifier
-job_id         : str   – correlation / job identifier
-workato_url    : str   – (optional) Workato recipe URL for processing metadata
-source_event   : str   – originating event name
-source_system  : str   – originating system name
-object_type    : str   – key in the CDM that holds the data array (e.g. "employees")
 Filters        : list  – each element is a dict with {field, value, operator}
 """
 
 import json
-import uuid
 import hashlib
 import copy
-from datetime import datetime, timezone
 from typing import Any
 
 
@@ -134,11 +127,6 @@ def main(
     Filters: list[dict]
     """
     raw_cdm = input.get("raw_cdm", "")
-    recipe_id = input.get("recipe_id", "")
-    job_id = input.get("job_id", "")
-    workato_url = input.get("workato_url", "")
-    source_event = input.get("source_event", "")
-    source_system = input.get("source_system", "")
     Filters = input.get("Filters", [])
 
     # ---- Step 1: Parse the raw CDM JSON string ----------------------------
@@ -162,18 +150,19 @@ def main(
         ]
 
     # ---- Build the new CDM shell ------------------------------------------
+    # Inherit the entire metadata and audit from the original CDM untouched;
+    # only metadata.batch and metadata.lineage are updated below.
     new_cdm: dict = {
         "metadata": copy.deepcopy(cdm.get("metadata", {})),
         object_type: filtered_records,
-        "audit": {},
+        "audit": copy.deepcopy(cdm.get("audit", {})),
     }
 
     # Convenience aliases
     old_meta = cdm.get("metadata", {})
     new_meta = new_cdm["metadata"]
-    original_object_type = old_meta.get('event',{}).get('object_type','')
 
-    # ---- Step 5: Populate metadata.lineage --------------------------------
+    # ---- Step 5: Update metadata.lineage ----------------------------------
     old_msg_id   = old_meta.get("message", {}).get("msg_id", "")
     old_batch_id = old_meta.get("batch", {}).get("batch_id", "")
 
@@ -203,50 +192,15 @@ def main(
         "transformation_step": transformation_step_str,
     }
 
-    # ---- Step 6: Fill metadata fields -------------------------------------
-    # 6a – message
-    new_meta["message"] = {
-        "msg_id":         str(uuid.uuid4()),
-        "correlation_id": job_id,
-        "timestamp_utc":  datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S.%fZ"
-        ),
-    }
-
-    # 6b – event
-    new_meta["event"] = {
-        "source_system": source_system,
-        "object_type":   original_object_type,
-        "source_event":  source_event,
-    }
-
-    # 6c – processing
-    new_meta["processing"] = {
-        "workflow_id": recipe_id,
-        "workato_url": workato_url,
-    }
-
-    # 6d – batch  (hash of the filtered array as batch_id)
+    # ---- Step 6: Update metadata.batch ------------------------------------
     filtered_json_bytes = json.dumps(
         filtered_records, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
     batch_hash = hashlib.sha256(filtered_json_bytes).hexdigest()
 
     new_meta["batch"] = {
-        "batch_id":    batch_hash,
-        "batch_size":  len(filtered_records),
-    }
-
-    # ---- Step 7: Fill audit section ---------------------------------------
-    filter_descriptions = [
-        f"{original_object_type}[{f['field']}] {f['operator']} {f.get('value', '')}"
-        for f in Filters
-    ]
-    new_cdm["audit"] = {
-        "last_modified_by": "Workato Transformer",
-        "change_log": (
-            f"Filter Transformer: {', '.join(filter_descriptions)}"
-        ),
+        "batch_id":     batch_hash,
+        "record_count": int(len(filtered_records)),
     }
 
     # ---- Step 8: Serialize and return -------------------------------------

@@ -100,7 +100,7 @@ def _evaluate_filter(record: dict, flt: dict) -> bool:
 
     cmp_actual, cmp_filter = _coerce(actual_value, filter_value)
 
-    if operator == "=":
+    if operator == "=" or operator == "" or not operator:
         return cmp_actual == cmp_filter
     if operator == "!=":
         return cmp_actual != cmp_filter

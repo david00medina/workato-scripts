@@ -1,11 +1,18 @@
 """
 CDM Diff Transformer
 ====================
-Computes the set difference A - B between two CDM payloads.
-Returns records present in CDM A but not in CDM B, matched by
-identity.canonical_id under the specified object_type.  The original
-metadata and audit objects from CDM A are inherited untouched; only
-metadata.batch and metadata.lineage are updated.
+Computes the set difference A - B between two CDM payloads, matched by
+identity.canonical_id under the specified object_type.
+
+Resolution strategy for matching records (same canonical_id in both):
+  • If A's version has strictly more information → kept in the result
+    (A carries data that B does not).
+  • If B's version has equal or more information → excluded from the
+    result (B already covers everything A has).
+
+Records only in A are always included.  The original metadata and audit
+objects from CDM A are inherited untouched; only metadata.batch and
+metadata.lineage are updated.
 
 Input parameters
 ----------------
@@ -19,9 +26,44 @@ import hashlib
 import copy
 
 
+# ---------------------------------------------------------------------------
+# Helper – recursive information score
+# ---------------------------------------------------------------------------
+def _info_score(obj) -> int:
+    """Count non-null, non-empty leaf values recursively.
+
+    This gives a single integer that represents how much actual data a
+    record (or any nested structure) carries.  Used to decide which of
+    two records with the same canonical_id is "richer".
+
+    Scoring rules
+    -------------
+    * ``None``          → 0
+    * ``""`` (empty str) → 0
+    * ``[]`` (empty list) → 0
+    * ``{}`` (empty dict) → 0
+    * non-empty str     → len(str)   (longer strings = more info)
+    * number / bool     → 1
+    * dict              → sum of children scores
+    * list              → sum of element scores
+    """
+    if obj is None:
+        return 0
+    if isinstance(obj, dict):
+        return sum(_info_score(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_info_score(v) for v in obj) if obj else 0
+    if isinstance(obj, str):
+        return len(obj) if obj else 0
+    return 1  # int, float, bool
+
+
 def main(input: dict) -> dict:
     """Compute A - B on the *object_type* array and return a new CDM payload
     wrapped in ``{"diff_cdm": "<json string>"}``.
+
+    For records that share a canonical_id, the version with strictly more
+    information is kept; otherwise the record is dropped.
     """
     cdm_a_raw = input.get("raw_cdm_a", "")
     cdm_b_raw = input.get("raw_cdm_b", "")
@@ -46,18 +88,26 @@ def main(input: dict) -> dict:
     records_a: list[dict] = cdm_a[object_type]
     records_b: list[dict] = cdm_b[object_type]
 
-    # ---- Step 3: Build set of canonical IDs from B ---------------------------
-    b_ids: set[str] = set()
+    # ---- Step 3: Index B by canonical_id (O(|B|)) ----------------------------
+    b_index: dict[str, dict] = {}
     for rec in records_b:
-        canonical_id = rec.get("identity", {}).get("canonical_id")
-        if canonical_id is not None:
-            b_ids.add(str(canonical_id))
+        cid = str(rec.get("identity", {}).get("canonical_id", ""))
+        b_index[cid] = rec  # last-write wins if B has dupes
 
-    # ---- Step 4: Filter A - B (records in A whose ID is not in B) ------------
-    diff_records = [
-        rec for rec in records_a
-        if str(rec.get("identity", {}).get("canonical_id", "")) not in b_ids
-    ]
+    # ---- Step 4: Build diff list (O(|A|)) ------------------------------------
+    # • A-only records    → always included
+    # • Matched records   → included only if A's version is strictly richer
+    diff_records: list[dict] = []
+    for rec_a in records_a:
+        cid = str(rec_a.get("identity", {}).get("canonical_id", ""))
+        rec_b = b_index.get(cid)
+        if rec_b is None:
+            # A-only → keep
+            diff_records.append(rec_a)
+        elif _info_score(rec_a) > _info_score(rec_b):
+            # A is richer → keep A's version
+            diff_records.append(rec_a)
+        # else: B has equal or more info → drop
 
     # ---- Build the new CDM shell ---------------------------------------------
     # Inherit the entire metadata and audit from CDM A untouched;
@@ -104,7 +154,7 @@ def main(input: dict) -> dict:
         "record_count": int(len(diff_records)),
     }
 
-    # ---- Step 8: Serialize and return ----------------------------------------
+    # ---- Serialize and return ------------------------------------------------
     diff_cdm_string = json.dumps(new_cdm, ensure_ascii=False)
     return {"diff_cdm": diff_cdm_string}
 
@@ -113,6 +163,7 @@ def main(input: dict) -> dict:
 # Quick self-test / demo
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # A: Engineering (full), Sales (sparse), HR (full)
     cdm_a = {
         "metadata": {
             "message": {"msg_id": "aaa-111", "correlation_id": "job-001",
@@ -126,16 +177,18 @@ if __name__ == "__main__":
         "departments": [
             {"identity": {"canonical_id": "1001",
                           "external_keys": {"bigquery_id": "1001"}},
-             "core": {"department_name": "Engineering", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "Engineering", "parent": "CTO", "dealer_key": "DK-1"}},
             {"identity": {"canonical_id": "1002",
                           "external_keys": {"bigquery_id": "1002"}},
              "core": {"department_name": "Sales", "parent": "", "dealer_key": ""}},
             {"identity": {"canonical_id": "1003",
                           "external_keys": {"bigquery_id": "1003"}},
-             "core": {"department_name": "HR", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "HR", "parent": "COO", "dealer_key": "DK-3"}},
         ],
+        "audit": {"last_modified_by": "BigQuery Sync", "change_log": "Initial"},
     }
 
+    # B: Sales (richer than A), Engineering (sparser than A)
     cdm_b = {
         "metadata": {
             "message": {"msg_id": "bbb-222", "correlation_id": "job-002",
@@ -144,33 +197,33 @@ if __name__ == "__main__":
                       "object_type": "Department", "source_event": "Scheduler"},
             "processing": {"workflow_id": "recipe-100",
                            "workato_url": "https://workato.com/recipes/100"},
-            "batch": {"batch_id": "batch-b-hash", "record_count": 1},
+            "batch": {"batch_id": "batch-b-hash", "record_count": 2},
         },
         "departments": [
+            {"identity": {"canonical_id": "1001",
+                          "external_keys": {"bigquery_id": "1001"}},
+             "core": {"department_name": "Engineering", "parent": "", "dealer_key": ""}},
             {"identity": {"canonical_id": "1002",
                           "external_keys": {"bigquery_id": "1002"}},
-             "core": {"department_name": "Sales", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "Sales", "parent": "CRO", "dealer_key": "DK-2"}},
         ],
+        "audit": {"last_modified_by": "BigQuery Sync", "change_log": "Initial"},
     }
 
     result = main({
         "raw_cdm_a": json.dumps(cdm_a),
         "raw_cdm_b": json.dumps(cdm_b),
-        "recipe_id": "recipe-300",
-        "job_id": "job-900",
-        "workato_url": "https://workato.com/recipes/300",
-        "source_event": "Scheduler",
-        "source_system": "BigQuery",
         "object_type": "departments",
     })
 
     parsed = json.loads(result["diff_cdm"])
+    names = [d["core"]["department_name"] for d in parsed["departments"]]
     print("=== Diff: A - B on departments ===")
-    print(f"A had       : 3 records (Engineering, Sales, HR)")
-    print(f"B had       : 1 record  (Sales)")
+    print(f"A had       : Engineering (rich), Sales (sparse), HR (A-only)")
+    print(f"B had       : Engineering (sparse), Sales (rich)")
     print(f"Result count: {len(parsed['departments'])}")
-    print(f"Result depts: {[d['core']['department_name'] for d in parsed['departments']]}")
-    print(f"Version     : {parsed['metadata']['event']['version']}")
-    print(f"Lineage     : {json.dumps(parsed['metadata']['lineage'], indent=2)}")
+    print(f"Result depts: {names}")
+    print(f"  → Engineering kept (A richer than B)")
+    print(f"  → Sales dropped   (B richer than A)")
+    print(f"  → HR kept         (A-only)")
     print(f"Batch       : {json.dumps(parsed['metadata']['batch'], indent=2)}")
-    print(f"Audit       : {json.dumps(parsed['audit'], indent=2)}")

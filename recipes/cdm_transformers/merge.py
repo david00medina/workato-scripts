@@ -1,12 +1,18 @@
 """
 CDM Merge Transformer
 =====================
-Computes the set union A ∪ B between two CDM payloads.
-Combines all records from CDM A and CDM B under the specified object_type,
-deduplicating by identity.canonical_id. When a record exists in both A and B,
-the version from A takes precedence (A wins).  The original metadata and
-audit objects from CDM A are inherited untouched; only metadata.batch and
-metadata.lineage are updated.
+Computes the set union A ∪ B between two CDM payloads, matched by
+identity.canonical_id under the specified object_type.
+
+Resolution strategy for matching records (same canonical_id in both):
+  • A deep merge is performed across every field of the two records.
+  • At each leaf, the value with more information wins (non-null over
+    null, longer string over shorter, populated dict over empty, etc.).
+  • New keys that only exist in one side are always carried over.
+
+Records only in A or only in B are included as-is.  The original metadata
+and audit objects from CDM A are inherited untouched; only metadata.batch
+and metadata.lineage are updated.
 
 Input parameters
 ----------------
@@ -20,12 +26,78 @@ import hashlib
 import copy
 
 
+# ---------------------------------------------------------------------------
+# Helper – recursive information score
+# ---------------------------------------------------------------------------
+def _info_score(obj) -> int:
+    """Count non-null, non-empty leaf values recursively.
+
+    Scoring rules
+    -------------
+    * ``None``          → 0
+    * ``""`` (empty str) → 0
+    * ``[]`` (empty list) → 0
+    * ``{}`` (empty dict) → 0
+    * non-empty str     → len(str)   (longer strings = more info)
+    * number / bool     → 1
+    * dict              → sum of children scores
+    * list              → sum of element scores
+    """
+    if obj is None:
+        return 0
+    if isinstance(obj, dict):
+        return sum(_info_score(v) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_info_score(v) for v in obj) if obj else 0
+    if isinstance(obj, str):
+        return len(obj) if obj else 0
+    return 1  # int, float, bool
+
+
+# ---------------------------------------------------------------------------
+# Helper – recursive deep merge (keeps the most info at every level)
+# ---------------------------------------------------------------------------
+def _deep_merge(a, b):
+    """Merge two values, preferring the richer one at every nesting level.
+
+    * Both dicts   → recurse key-by-key; union of all keys.
+    * Both lists   → keep the longer list.
+    * Otherwise    → keep whichever side has the higher _info_score.
+    """
+    # Fast path: identical references or one side is None
+    if a is b:
+        return a
+    if a is None:
+        return b
+    if b is None:
+        return a
+
+    # Dict + Dict → recurse
+    if isinstance(a, dict) and isinstance(b, dict):
+        merged: dict = {}
+        for key in a.keys() | b.keys():          # union of keys – O(|keys|)
+            if key in a and key in b:
+                merged[key] = _deep_merge(a[key], b[key])
+            elif key in a:
+                merged[key] = a[key]
+            else:
+                merged[key] = b[key]
+        return merged
+
+    # List + List → keep the longer one
+    if isinstance(a, list) and isinstance(b, list):
+        return a if len(a) >= len(b) else b
+
+    # Leaf vs leaf → higher score wins; tie → prefer a (left bias)
+    return a if _info_score(a) >= _info_score(b) else b
+
+
 def main(input: dict) -> dict:
     """Compute A ∪ B on the *object_type* array and return a new CDM payload
     wrapped in ``{"merged_cdm": "<json string>"}``.
 
-    Deduplication strategy: records from A take precedence over B when both
-    share the same identity.canonical_id.
+    For records that share a canonical_id, both sides are deep-merged
+    field-by-field to retain the maximum amount of information.
     """
     cdm_a_raw = input.get("raw_cdm_a", "")
     cdm_b_raw = input.get("raw_cdm_b", "")
@@ -50,23 +122,27 @@ def main(input: dict) -> dict:
     records_a: list[dict] = cdm_a[object_type]
     records_b: list[dict] = cdm_b[object_type]
 
-    # ---- Step 3: Build an ordered dict of records from A (keyed by ID) -------
-    seen_ids: dict[str, dict] = {}
+    # ---- Step 3: Index A by canonical_id (O(|A|)) ----------------------------
+    # Preserves insertion order so result ordering matches A first, then B-only.
+    a_index: dict[str, int] = {}       # cid → index in merged_records
     merged_records: list[dict] = []
 
-    # A records go in first — they take precedence
     for rec in records_a:
-        canonical_id = str(rec.get("identity", {}).get("canonical_id", ""))
-        if canonical_id not in seen_ids:
-            seen_ids[canonical_id] = rec
+        cid = str(rec.get("identity", {}).get("canonical_id", ""))
+        if cid not in a_index:
+            a_index[cid] = len(merged_records)
             merged_records.append(rec)
 
-    # ---- Step 4: Append B records that are not already in A ------------------
-    for rec in records_b:
-        canonical_id = str(rec.get("identity", {}).get("canonical_id", ""))
-        if canonical_id not in seen_ids:
-            seen_ids[canonical_id] = rec
-            merged_records.append(rec)
+    # ---- Step 4: Merge / append B records (O(|B|)) ---------------------------
+    for rec_b in records_b:
+        cid = str(rec_b.get("identity", {}).get("canonical_id", ""))
+        if cid in a_index:
+            # Deep-merge into the existing A record in-place
+            idx = a_index[cid]
+            merged_records[idx] = _deep_merge(merged_records[idx], rec_b)
+        else:
+            a_index[cid] = len(merged_records)
+            merged_records.append(rec_b)
 
     # ---- Build the new CDM shell ---------------------------------------------
     # Inherit the entire metadata and audit from CDM A untouched;
@@ -113,7 +189,7 @@ def main(input: dict) -> dict:
         "record_count": int(len(merged_records)),
     }
 
-    # ---- Step 8: Serialize and return ----------------------------------------
+    # ---- Serialize and return ------------------------------------------------
     merged_cdm_string = json.dumps(new_cdm, ensure_ascii=False)
     return {"merged_cdm": merged_cdm_string}
 
@@ -122,7 +198,7 @@ def main(input: dict) -> dict:
 # Quick self-test / demo
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # CDM A has: Engineering (1001), Sales (1002), HR (1003)
+    # A: Engineering (has parent, no dealer_key), Sales (sparse), HR (A-only)
     cdm_a = {
         "metadata": {
             "message": {"msg_id": "aaa-111", "correlation_id": "job-001",
@@ -136,17 +212,18 @@ if __name__ == "__main__":
         "departments": [
             {"identity": {"canonical_id": "1001",
                           "external_keys": {"bigquery_id": "1001"}},
-             "core": {"department_name": "Engineering", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "Engineering", "parent": "CTO", "dealer_key": ""}},
             {"identity": {"canonical_id": "1002",
                           "external_keys": {"bigquery_id": "1002"}},
              "core": {"department_name": "Sales", "parent": "", "dealer_key": ""}},
             {"identity": {"canonical_id": "1003",
                           "external_keys": {"bigquery_id": "1003"}},
-             "core": {"department_name": "HR", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "HR", "parent": "COO", "dealer_key": "DK-3"}},
         ],
+        "audit": {"last_modified_by": "BigQuery Sync", "change_log": "Initial"},
     }
 
-    # CDM B has: Sales (1002 - duplicate), Marketing (1004 - new), Finance (1005 - new)
+    # B: Engineering (has dealer_key, no parent), Sales (rich), Finance (B-only)
     cdm_b = {
         "metadata": {
             "message": {"msg_id": "bbb-222", "correlation_id": "job-002",
@@ -158,42 +235,38 @@ if __name__ == "__main__":
             "batch": {"batch_id": "batch-b-hash", "record_count": 3},
         },
         "departments": [
+            {"identity": {"canonical_id": "1001",
+                          "external_keys": {"bigquery_id": "1001", "odoo_id": "OD-1"}},
+             "core": {"department_name": "Engineering", "parent": "", "dealer_key": "DK-1"}},
             {"identity": {"canonical_id": "1002",
                           "external_keys": {"bigquery_id": "1002"}},
-             "core": {"department_name": "Sales (updated)", "parent": "", "dealer_key": ""}},
-            {"identity": {"canonical_id": "1004",
-                          "external_keys": {"bigquery_id": "1004"}},
-             "core": {"department_name": "Marketing", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "Sales", "parent": "CRO", "dealer_key": "DK-2"}},
             {"identity": {"canonical_id": "1005",
                           "external_keys": {"bigquery_id": "1005"}},
-             "core": {"department_name": "Finance", "parent": "", "dealer_key": ""}},
+             "core": {"department_name": "Finance", "parent": "CFO", "dealer_key": "DK-5"}},
         ],
+        "audit": {"last_modified_by": "BigQuery Sync", "change_log": "Initial"},
     }
 
     result = main({
         "raw_cdm_a": json.dumps(cdm_a),
         "raw_cdm_b": json.dumps(cdm_b),
-        "recipe_id": "recipe-400",
-        "job_id": "job-950",
-        "workato_url": "https://workato.com/recipes/400",
-        "source_event": "Scheduler",
-        "source_system": "BigQuery",
         "object_type": "departments",
     })
 
     parsed = json.loads(result["merged_cdm"])
-    print("=== Merge: A ∪ B on departments ===")
-    print(f"A had       : 3 records (Engineering, Sales, HR)")
-    print(f"B had       : 3 records (Sales [dup], Marketing, Finance)")
+    print("=== Merge: A ∪ B on departments (deep-merge) ===")
     print(f"Result count: {len(parsed['departments'])}")
-    print(f"Result depts: {[d['core']['department_name'] for d in parsed['departments']]}")
-    print(f"Version     : {parsed['metadata']['event']['version']}")
-    print(f"Lineage     : {json.dumps(parsed['metadata']['lineage'], indent=2)}")
-    print(f"Batch       : {json.dumps(parsed['metadata']['batch'], indent=2)}")
-    print(f"Audit       : {json.dumps(parsed['audit'], indent=2)}")
+    for dept in parsed["departments"]:
+        cid = dept["identity"]["canonical_id"]
+        name = dept["core"]["department_name"]
+        parent = dept["core"]["parent"]
+        dk = dept["core"]["dealer_key"]
+        ext = dept["identity"].get("external_keys", {})
+        print(f"  {cid} {name:15s} parent={parent!r:6s} dealer_key={dk!r:6s} ext_keys={ext}")
     print()
-
-    # Verify: Sales should be A's version (not "Sales (updated)") since A wins
-    sales_rec = [d for d in parsed["departments"]
-                 if d["identity"]["canonical_id"] == "1002"][0]
-    print(f"Sales name  : '{sales_rec['core']['department_name']}' (should be 'Sales', A wins)")
+    print("Expected:")
+    print("  1001 Engineering   parent='CTO'  dealer_key='DK-1' ext_keys={bigquery+odoo}")
+    print("  1002 Sales         parent='CRO'  dealer_key='DK-2'")
+    print("  1003 HR            parent='COO'  dealer_key='DK-3' (A-only)")
+    print("  1005 Finance       parent='CFO'  dealer_key='DK-5' (B-only)")

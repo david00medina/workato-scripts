@@ -59,11 +59,21 @@ def _evaluate_filter(record: dict, flt: dict) -> bool:
 
     actual_value = _resolve_dot_path(record, field)
 
-    # --- nullity checks (value-independent) --------------------------------
+    # --- nullity / emptiness checks (value-independent) ---------------------
+    # Considers a field empty when it is None, an empty string, an empty
+    # list, or an empty dict.
     if operator == "is null":
-        return actual_value is None
+        if actual_value is None:
+            return True
+        if isinstance(actual_value, (str, list, dict)) and len(actual_value) == 0:
+            return True
+        return False
     if operator == "is not null":
-        return actual_value is not None
+        if actual_value is None:
+            return False
+        if isinstance(actual_value, (str, list, dict)) and len(actual_value) == 0:
+            return False
+        return True
 
     # If the resolved value is None for non-null operators → no match
     if actual_value is None:

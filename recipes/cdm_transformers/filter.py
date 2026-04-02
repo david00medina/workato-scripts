@@ -38,7 +38,6 @@ def _resolve_dot_path(record: dict, path: str) -> Any:
     """
     current = record
     for segment in path.split("."):
-        segment = segment[1:]
         if isinstance(current, dict) and segment in current:
             current = current[segment]
         else:
@@ -56,9 +55,14 @@ def _evaluate_filter(record: dict, flt: dict) -> bool:
     -------------------
     =  !=  >  >=  <  <=  is in  not in  is null  is not null
     """
-    field: str    = flt["field"]
-    operator: str = flt["operator"].strip().lower()
-    filter_value  = flt.get("value")
+    raw_field: str = flt["field"]
+    operator: str  = flt["operator"].strip().lower()
+    filter_value   = flt.get("value")
+
+    # Strip the first segment (array key like "departments") since we're
+    # resolving against individual records, not the full CDM.
+    parts = raw_field.split(".", 1)
+    field = parts[1] if len(parts) > 1 else parts[0]
 
     actual_value = _resolve_dot_path(record, field)
 
@@ -135,7 +139,6 @@ def main(
     workato_url = input.get("workato_url", "")
     source_event = input.get("source_event", "")
     source_system = input.get("source_system", "")
-    object_type = input.get("object_type", "")
     Filters = input.get("Filters", [])
 
     # ---- Step 1: Parse the raw CDM JSON string ----------------------------
@@ -383,18 +386,18 @@ if __name__ == "__main__":
 
     # ----- Test 1: equality on nested dot-path ----------------------------
     in_payload = {
-        "recipe_id": "recipe-200",
-        "job_id": "job-555",
-        "source_system": "Odoo",
-        "source_event": "Read",
-        "object_type": "Departments",
-        "Filters": [
-            {"field": "departments.core.status", "operator": "=", "value": "active"},
-            {"field": "employment.department", "operator": "=", "value": "Engineering"},
-        ],
         "raw_cdm": raw,
-        "workato_url": "https://workato.com/recipes/200",
-    }
+		"source_system": "BigQuery",
+		"source_event": "Scheduler",
+		"Filters": [
+			{
+				"field": "departments.identity.canonical_id",
+				"operator": "not in",
+				"value": "4898652453064971392"
+			}
+		],
+		"object_type": "Department"
+	}
     result = main(in_payload)
     parsed = json.loads(result["filtered_cdm"])
     print("=== Test 1: core.status = active AND employment.department = Engineering ===")

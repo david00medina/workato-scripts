@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "event": {
+      "version": "v1.0",
+      "source_system": "BigQuery",
+      "object_type": "Department",
+      "source_event": "Scheduler"
+    },
+    "message": {
+      "timestamp_utc": "2026-04-01T23:16:51.207+00:00",
+      "msg_id": "4b075ee8-fab5-4e78-be3e-d150bd6c3c9d",
+      "correlation_id": "j-AYcYa9Hp-Cb9MBk-CE"
+    },
+    "processing": {
+      "workflow_id": "1956267",
+      "workato_url": "https://app.eu.workato.com/recipes/1956267/job/j-AYcYa9Hp-Cb9MBk-CE"
+    },
+    "batch": {
+      "batch_id": "0923d2e567d49f2e9cb45f64387f2ad0ba9dfa17568296cd240c39bad1d70694",
+      "record_count": 11.0
+    }
+  },
+  "departments": [
+    {
+      "identity": {
+        "canonical_id": "4898652453064971392",
+        "external_keys": {
+          "bigquery_id": "4898652453064971392"
+        }
+      },
+      "core": {
+        "parent": "",
+        "department_name": "Johtoryhmä",
+        "dealer_key": ""
+      }
+    }
+  ]
+}
